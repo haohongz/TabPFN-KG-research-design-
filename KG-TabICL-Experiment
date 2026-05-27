@@ -1,0 +1,263 @@
+# KG-Adapter for TabICL: Knowledge Graph Injection into Tabular Foundation Models
+
+> University of Michigan | PKU School of Medicine Collaboration
+>
+> Haohong Zhang (郑浩宏) | Advisor: Prof. Liu Molei (刘默雷)
+
+## 1. Research Question
+
+Tabular foundation models like TabICL and TabPFNv2 learn cell embeddings purely from data distributions — they have no awareness of domain knowledge (e.g., biological relationships between genes). Can we inject external knowledge graph (KG) information into these models to improve predictions, especially in high-dimensional, low-sample (d >> n) settings?
+
+## 2. Method: KG-Adapter (Variant A — Scalar Gate)
+
+We design a lightweight adapter module that fuses KG embeddings into the frozen TabICL backbone:
+
+```
+e'_{ij} = α_j · e_{ij} + (1 − α_j) · z̃_j
+```
+
+where:
+- `e_{ij}` is TabICL's original cell embedding for sample `i`, feature `j` (128-dim)
+- `z̃_j = f_align(z_j^KG)` is the aligned KG embedding for feature `j`
+- `α_j = sigmoid(a_j)` is a per-feature scalar gate controlling how much KG to inject
+- The entire TabICL backbone is **frozen**; only the adapter parameters are added
+
+### Architecture
+
+```
+Input table (N × P)
+    ↓
+[TF_col] Column-wise embedding (frozen)
+    ↓
+Cell embeddings: E ∈ R^{N × P × 128}      ← INJECTION POINT
+    ↓
+★ KG-Adapter: E' = α·E + (1−α)·z̃          ← OUR MODULE
+    ↓
+[TF_row] Row-wise interaction (frozen)
+    ↓
+[TF_icl] In-context learning (frozen)
+    ↓
+Predictions
+```
+
+### KG Embedding Construction
+
+Each feature's KG embedding is a 512-dim vector composed of:
+
+| Component | Dimension | Source | Purpose |
+|-----------|-----------|--------|---------|
+| Sentence-BERT | 384 | `all-MiniLM-L6-v2` encoding of feature name | Semantic similarity |
+| Hetionet TransE | 128 | PyKEEN TransE trained on Hetionet (45,158 entities, 24 relations, 2.25M triples) | Structural knowledge |
+
+Feature names are mapped to the nearest Hetionet entity via SBERT cosine similarity, then the entity's TransE embedding is retrieved.
+
+## 3. Experimental Setup
+
+### Datasets
+
+| Dataset | Samples (n) | Features (d) | Task | Feature Names |
+|---------|-------------|--------------|------|---------------|
+| BreastCancer (sklearn) | 569 | 30 | Malignant vs Benign | Cell morphology: mean radius, worst texture, etc. |
+| Leukemia (Golub et al. 1999) | 72 | 1,000 (top variance from 7,128) | ALL vs AML | Gene probe IDs: gene_6, gene_9, etc. |
+
+### Methods (5-Fold Stratified CV)
+
+| Method | Description |
+|--------|-------------|
+| **Baseline** | Original pretrained TabICL, no modification |
+| **+ Real KG** | SBERT + Hetionet TransE embeddings, aligned to feature names |
+| **+ Random KG** | Random vectors (same dimensionality) — ablation: is KG content useful? |
+| **+ Permuted KG** | Real KG embeddings with shuffled feature assignments — ablation: is alignment important? |
+
+### Gate Strength Settings
+
+The scalar gate `α = sigmoid(a)` controls KG injection strength:
+
+| Scale parameter `a` | Gate α | Meaning |
+|---------------------|--------|---------|
+| 1.0 | 0.73 | 73% original + 27% KG (mild injection) |
+| −2.0 | 0.12 | 12% original + 88% KG (strong injection) |
+
+## 4. Key Finding: Why Front Injection, Not Back
+
+### Experiment 1: Back injection (at row_interactor output)
+
+We first tried injecting KG at the **output of TF_row** (h ∈ R^{B×T×512}):
+
+```
+[TF_col] → [TF_row] → h ∈ R^{B×T×512} → ★ KG injection here → [TF_icl]
+```
+
+**Result:** All four methods produced **identical** predictions (proba diff < 0.4%).
+
+**Diagnosis:** At this point, all 30 features have been fused into a single 512-dim row vector. Adding a KG signal here is equivalent to adding a **constant offset to every sample** — it shifts all predictions equally and cannot change the classification boundary. We verified this with a diagnostic hook:
+
+```
+h norm:              224.71
+KG injection norm:     1.45
+Ratio:                 0.6%
+```
+
+### Experiment 2: Front injection (at col_embedder output)
+
+We moved the injection point to the **output of TF_col** (E ∈ R^{B×T×(F+C)×128}):
+
+```
+[TF_col] → E ∈ R^{B×T×34×128} → ★ KG injection here → [TF_row] → [TF_icl]
+```
+
+At this point, each feature still has its own 128-dim embedding. The KG can apply **different** information to each feature via per-feature gate `α_j`.
+
+**Result:** Four methods clearly differentiated (see results below).
+
+**Conclusion:** The injection point must be **before feature fusion** (TF_row), where per-feature embeddings are still separate. This validates our method design and applies equally to TabPFNv2 (inject after FeatureEncoder, before the 24-layer transformer).
+
+## 5. Results
+
+### Front Injection, Strong KG (α ≈ 0.12, scale = −2.0)
+
+**BreastCancer (n=569, d=30)**
+
+| Method | Accuracy | F1 | AUC |
+|--------|----------|-----|-----|
+| Baseline | **0.9807 ± 0.0086** | **0.9807 ± 0.0086** | 0.9970 ± 0.0047 |
+| + Real KG | 0.9719 ± 0.0129 | 0.9718 ± 0.0129 | **0.9972 ± 0.0041** |
+| + Random KG | 0.9789 ± 0.0089 | 0.9788 ± 0.0091 | 0.9971 ± 0.0038 |
+| + Permuted KG | 0.9824 ± 0.0096 | 0.9824 ± 0.0097 | 0.9967 ± 0.0049 |
+
+**Leukemia (n=72, d=1000)**
+
+| Method | Accuracy | F1 | AUC |
+|--------|----------|-----|-----|
+| Baseline | **0.9724 ± 0.0339** | **0.9722 ± 0.0341** | **0.9911 ± 0.0178** |
+| + Real KG | 0.9438 ± 0.0532 | 0.9415 ± 0.0568 | 0.9867 ± 0.0267 |
+| + Random KG | 0.9714 ± 0.0350 | 0.9706 ± 0.0360 | 0.9822 ± 0.0356 |
+| + Permuted KG | 0.9714 ± 0.0350 | 0.9706 ± 0.0360 | 0.9867 ± 0.0267 |
+
+### Front Injection, Mild KG (α ≈ 0.73, scale = 1.0)
+
+**BreastCancer (n=569, d=30)**
+
+| Method | Accuracy | F1 | AUC |
+|--------|----------|-----|-----|
+| Baseline | **0.9807 ± 0.0086** | **0.9807 ± 0.0086** | 0.9970 ± 0.0047 |
+| + Real KG | 0.9772 ± 0.0089 | 0.9772 ± 0.0089 | 0.9972 ± 0.0044 |
+| + Random KG | 0.9772 ± 0.0119 | 0.9771 ± 0.0119 | 0.9972 ± 0.0049 |
+| + Permuted KG | 0.9807 ± 0.0102 | 0.9807 ± 0.0102 | **0.9973 ± 0.0043** |
+
+### Experiment Figures
+
+#### Figure 1: Front injection with strong KG (scale = −2.0)
+
+![Front injection results](figures/fig1_front_injection.png)
+
+#### Figure 2: Gate strength comparison on BreastCancer
+
+![Scale comparison](figures/fig2_scale_comparison.png)
+
+#### Figure 3: Full results summary table
+
+![Results table](figures/fig3_results_table.png)
+
+#### Figure 4: Front injection with mild KG (scale = 1.0)
+
+![Mild KG results](figures/kg_s1.png)
+
+## 6. Analysis
+
+### Why Real KG underperforms Baseline
+
+1. **Low mapping quality for BreastCancer:** Feature names like "mean radius" and "mean texture" are cell morphology measurements, not gene names. Their mapping to Hetionet entities has very low similarity (mean = 0.164). "mean radius" → "Gene::360" has no biological meaning.
+
+2. **Numeric gene IDs for Leukemia:** The Golub dataset uses probe IDs like "gene_6", "gene_9" instead of gene symbols (BRCA1, TP53). The SBERT mapper matches these to Hetionet entities by string similarity ("gene_9" → "Gene::9"), which is coincidental, not meaningful.
+
+3. **Untrained alignment:** The orthogonal projection preserves KG structure but does not learn to align KG space to TabICL's embedding space. With random projection, injecting *any* external vector acts as regularization/noise, explaining why Random KG and Permuted KG sometimes perform comparably.
+
+### What this tells us
+
+- **The injection mechanism works** — four methods produce clearly different results
+- **KG quality matters** — wrong KG hurts more than random noise (Real KG < Random KG when mapping is poor)
+- **Gate strength matters** — stronger injection amplifies both benefits and harms
+- **Alignment training is essential** — without it, even correct KG cannot help
+
+## 7. Transferability to TabPFNv2
+
+The KG-Adapter module is designed to be architecture-agnostic. The injection point is logically equivalent across models:
+
+| Model | Injection Point | Embedding Shape | embed_dim |
+|-------|----------------|-----------------|-----------|
+| TabICL | After `col_embedder` | (B, T, P+4, 128) | 128 |
+| TabPFNv2 | After `FeatureEncoder` | (B, T, P+1, 512) | 512 |
+
+To transfer: change `embed_dim=128` to `embed_dim=512` and hook on the corresponding module. The adapter code is identical.
+
+## 8. Next Steps
+
+1. **Real gene-name datasets:** Use datasets with actual gene symbols (TCGA-BRCA, LINCS L1000) so features map meaningfully to Hetionet entities
+2. **Train alignment MLP:** Add a fine-tuning loop to learn `f_align` through backpropagation, so KG embeddings are properly aligned to TabICL's embedding space
+3. **Variant B & C:** Implement feature-wise attention gate and low-rank residual adapter
+4. **TabPFNv2 experiments:** Transfer the same adapter to TabPFNv2 for comparison
+
+## 9. Reproduction
+
+### Requirements
+
+```bash
+pip install tabicl sentence-transformers pykeen scikit-learn matplotlib
+```
+
+### Run on GPU cluster (UMich Great Lakes)
+
+```bash
+ssh haohongz@greatlakes.arc-ts.umich.edu
+salloc --partition=spgpu --gres=gpu:1 --mem=8G --time=2:00:00 --account=lsa2
+conda activate ~/tabpfn_env
+
+# Front injection, strong KG
+python tabicl_kg_real.py --device cuda --scale -2.0
+
+# Front injection, mild KG
+python tabicl_kg_real.py --device cuda --scale 1.0 --output kg_s1.png
+
+# Hook dimension verification
+python tabicl_kg_real.py --demo_hook --device cuda
+```
+
+### Key dimensions (verified by hook)
+
+```
+col_embedder output: (B, T, F+C, 128)  = (1, 105, 34, 128)
+  B = 1 (ensemble batch)
+  T = 105 (100 train + 5 test)
+  F+C = 34 (30 features + 4 CLS tokens)
+  128 = embed_dim
+
+row_interactor output: (B, T, 512)
+  512 = embed_dim(128) × num_cls(4)
+```
+
+## 10. File Structure
+
+```
+├── README.md                    # This file
+├── tabicl_kg_real.py            # Main experiment code
+├── figures/
+│   ├── fig1_front_injection.png # Front injection results (scale=-2.0)
+│   ├── fig2_scale_comparison.png# Gate strength comparison
+│   ├── fig3_results_table.png   # Full numerical results
+│   ├── kg_real_comparison.png   # Raw output plot (scale=-2.0)
+│   └── kg_s1.png                # Raw output plot (scale=1.0)
+├── results/
+│   ├── kg_real_comparison.json  # Raw results (scale=-2.0)
+│   └── kg_s1.json               # Raw results (scale=1.0)
+└── docs/
+    └── KG_TabFM_Method_Design.md # Full method design document
+```
+
+## References
+
+- TabICL: Gang, J. et al. (2025). "TabICL: A Tabular Foundation Model for In-Context Learning." ICML 2025.
+- TabPFNv2: Hollmann, N. et al. (2025). "Accurate Predictions on Small Data with a Tabular Foundation Model." Nature.
+- Hetionet: Himmelstein, D. et al. (2017). "Systematic integration of biomedical knowledge prioritizes drugs for repurposing." eLife.
+- SBERT: Reimers, N. & Gurevych, I. (2019). "Sentence-BERT." EMNLP.
+- Golub Leukemia: Golub, T.R. et al. (1999). "Molecular Classification of Cancer." Science.
