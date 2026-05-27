@@ -217,7 +217,7 @@ Leukemia 的列名是 gene_6, gene_9 这种编号，按字面数字匹配到 Gen
 
 正交投影保距但不学对齐。不同 KG 经过未训练的投影后差异被部分抹平，导致 Real KG 和 Random KG 表现接近。
 
-**原因三：与 Aurora 实验一致**
+**原因三：与孙傲实验一致**
 
 PPT Slide 3-4 中 Aurora 在 TabPFN 上也发现 KGHead_real 没有显著优于 BaselineHead，分析的原因同样是"TabPFN 原生表征已经过于丰富"。
 
