@@ -71,7 +71,7 @@ PPT Slide 6 设计的是在 TabPFN/TabICL **全部层跑完之后**注入 KG：
 输入表格 → [TabICL 全部层] → h (512维) → ★ 在这里注入 KG → MLP → 预测
 ```
 
-Aurora 的实验（PPT Slide 3）在 TabPFN 上验证了这个方案：KGHead_real 没有显著优于 BaselineHead。
+孙傲在 TabPFN 上验证了这个方案：KGHead_real 没有显著优于 BaselineHead。
 
 ### 3.2 我们的实验 Part 1：后置注入验证
 
