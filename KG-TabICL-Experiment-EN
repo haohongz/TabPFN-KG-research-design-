@@ -1,9 +1,5 @@
 # KG-Adapter for TabICL: Knowledge Graph Injection into Tabular Foundation Models
 
-> University of Michigan | PKU School of Medicine Collaboration
->
-> Haohong Zhang (郑浩宏) | Advisor: Prof. Liu Molei (刘默雷)
-
 ## 1. Research Question
 
 Tabular foundation models like TabICL and TabPFNv2 learn cell embeddings purely from data distributions — they have no awareness of domain knowledge (e.g., biological relationships between genes). Can we inject external knowledge graph (KG) information into these models to improve predictions, especially in high-dimensional, low-sample (d >> n) settings?
