@@ -36,7 +36,7 @@ e'_{ij} = α_j · e_{ij} + (1 − α_j) · z̃_j
 - `α_j = sigmoid(a_j)`：per-feature 的标量门控，控制注入多少 KG
 - TabICL backbone **完全冻结**，只加 adapter 参数
 
-### 2.3 外部知识编码（对应 PPT Slide 7）
+### 2.3 外部知识编码
 
 ```
 步骤 1：文本语义编码
