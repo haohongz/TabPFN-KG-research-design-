@@ -1,8 +1,5 @@
 # KG-Adapter for TabICL：将知识图谱注入表格基础模型
 
-> University of Michigan & 北京大学医学部 合作项目
->
-> 郑浩宏 (Haohong Zhang) | 导师：刘默雷教授
 
 ---
 
