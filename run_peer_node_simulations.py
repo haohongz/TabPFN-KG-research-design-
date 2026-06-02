@@ -130,8 +130,9 @@ def run_experiment_grid():
         for seed in seeds:
             tasks.append((exp, seed, base_kwargs))
 
-    # Support PBS_NCPUS environment variable (used by Katana)
-    n_jobs = int(os.environ.get("PBS_NCPUS", multiprocessing.cpu_count()))
+    # Strictly limit to 16 cores to prevent Out-Of-Memory (OOM) kills on Katana
+    # (Sometimes Katana nodes report 64+ cores, which spawns too many workers and blows up RAM)
+    n_jobs = 16
     print(f"Starting parallel execution with {n_jobs} CPU cores for {len(tasks)} tasks...")
 
     # Run in parallel
