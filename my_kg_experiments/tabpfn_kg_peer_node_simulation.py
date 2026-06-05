@@ -21,7 +21,7 @@ from torch import nn
 from torch.nn import functional as F
 from sklearn.model_selection import StratifiedKFold
 
-ROOT = Path(__file__).resolve().parents[0]
+ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
