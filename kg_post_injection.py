@@ -200,7 +200,7 @@ def kg_info(w_obs: torch.Tensor, w_true: torch.Tensor) -> float:
     """KG information = mean per-direction |cosine| between the OBSERVED group-weight
     vector w_obs and the oracle one w_true = <e_block, e_y>.
 
-    Same task-aware measure as tabpfn_kg_pre_injection.kg_info: it scores the signal
+    Same task-aware measure as kg_pre_injection.kg_info: it scores the signal
     the gate actually consumes (folds e- and e_y-corruption into one number in [0, 1]),
     not raw embedding fidelity. |cos| because a sign-flipped weight is equally usable.
     oracle -> 1.0; permuted/random -> ~0. Replaces the old task-agnostic, e_y-blind
