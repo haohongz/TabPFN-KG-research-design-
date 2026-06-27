@@ -111,6 +111,7 @@ def generate_data_b(
     *, dgp: str, family: str, n_train: int, n_test: int, n_features: int, n_groups: int,
     feature_noise: float, label_noise: float, rank: int, seed: int,
     shuffle_features: bool = False, n_edges: int = 1, knn: int = 0,
+    label_combiner: str = "mlp", mlp_hidden: int = 16,
 ):
     """Self-contained B simulation; returns (A.Data, E) where E is the (d×r) feature
     embedding matrix for family='factor' (else None). Communities/features stay in fixed
@@ -155,11 +156,22 @@ def generate_data_b(
         perm = rng.permutation(G_node)
         edges = [(int(perm[2 * i]), int(perm[2 * i + 1])) for i in range(ne)]
         A_node = np.zeros((G_node, G_node), np.float32)
-        g = np.zeros(n_total, np.float32)
+        # === 改动:收集每条 KG 边的交互项(只放乘积 -> 纯交互,无主效应) ===
+        prods = []
         for a, b in edges:
             A_node[a, b] = A_node[b, a] = 1.0
-            g += U[:, a] * U[:, b]
-        A_true = A_node[np.ix_(groups, groups)].astype(np.float32)  # lift node graph to feats
+            prods.append(U[:, a] * U[:, b])          # 每条边贡献 1 个交互项
+        P = np.stack(prods, axis=1)                  # (n_total, ne)
+        if label_combiner == "sum":                  # 老逻辑:乘积直接相加(留作对照)
+            g = P.sum(axis=1).astype(np.float32)
+        else:                                         # 新逻辑:乘积过固定随机 MLP(非线性读出)
+            h = int(mlp_hidden)
+            W1 = rng.standard_normal((ne, h)).astype(np.float32)
+            b1 = rng.standard_normal(h).astype(np.float32)
+            W2 = rng.standard_normal((h, 1)).astype(np.float32)
+            g = (np.tanh(P @ W1 + b1) @ W2)[:, 0].astype(np.float32)
+        # === 改动结束 ===
+        A_true = A_node[np.ix_(groups, groups)].astype(np.float32)  # lift node graph to feats  # lift node graph to feats
         np.fill_diagonal(A_true, 0.0)
         g = (g - g.mean()) / max(g.std(), 1e-6)
         E = None
@@ -223,6 +235,7 @@ def knn_graph(S: np.ndarray, k: int) -> np.ndarray:
 def build_problem(
     *, dgp, family, frac, seed, n_train, n_test, n_features, n_groups,
     feature_noise, label_noise, rank, reorder=False, n_edges=1, knn=0,
+    label_combiner="mlp", mlp_hidden=16,
 ):
     """Generate data + the OBSERVED KG (optionally corrupted by `frac`) + its quality + the
     pooled bias M. Branches on family because corruption differs for a 0/1 graph vs a
@@ -231,6 +244,7 @@ def build_problem(
         dgp=dgp, family=family, n_train=n_train, n_test=n_test, n_features=n_features,
         n_groups=n_groups, feature_noise=feature_noise, label_noise=label_noise,
         rank=rank, seed=seed, shuffle_features=False, n_edges=n_edges, knn=knn,
+        label_combiner=label_combiner, mlp_hidden=mlp_hidden,
     )
     if family in ("factor", "similarity"):
         if frac == 0.0:
@@ -275,8 +289,12 @@ def build_problem(
         d = dataclasses.replace(
             d, X_train=d.X_train[:, order], X_test=d.X_test[:, order], groups=d.groups[order],
         )
-    return d, group_M(A_obs), q_val
-
+    M = group_M(A_obs)
+    assert float(M.abs().sum()) > 0, (
+        "Pooled KG bias M is all zeros — KG 不会被注入。检查 n_features / n_edges / "
+        "FEATURES_PER_GROUP,确保 community 至少跨到 token 层面。"
+    )
+    return d, M, q_val
 # ---------------------------------------------------------------------------
 # Monkey-patch: additive KG bias on feature-attention logits (Eq. 6)
 # ---------------------------------------------------------------------------
@@ -514,13 +532,14 @@ def scan_layers_fixed(eval_clf, Xte, yte, M, *, alpha: float, n_layers: int) -> 
 def run(
     *, dgp, seed, mode, family, rank, reorder, n_train, n_test, n_features, n_groups,
     feature_noise, label_noise, scan_alphas, epochs, lr, query_frac, l1, frac, model_path,
-    device, n_edges=1, knn=0,
+    device, n_edges=1, knn=0, label_combiner="mlp", mlp_hidden=16,
 ) -> list[dict]:
     set_seed(seed)
     d, M, q_val = build_problem(
         dgp=dgp, family=family, frac=frac, seed=seed, n_train=n_train, n_test=n_test,
         n_features=n_features, n_groups=n_groups, feature_noise=feature_noise,
         label_noise=label_noise, rank=rank, reorder=reorder, n_edges=n_edges, knn=knn,
+        label_combiner=label_combiner, mlp_hidden=mlp_hidden,
     )
 
     eval_clf = fit_tabpfn(d.X_train.astype(np.float32), d.y_train,
@@ -688,6 +707,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-edges", type=int, default=1,
                    help="number of interacting node pairs for family='epistasis'/'interaction' "
                         "(remaining nodes are distractors)")
+    p.add_argument("--label-combiner", choices=["mlp", "sum"], default="mlp",
+                   help="interaction-family label readout: mlp=nonlinear (default), "
+                        "sum=legacy linear sum (control)")
+    p.add_argument("--mlp-hidden", type=int, default=16,
+                   help="hidden width of the label MLP combiner")
     p.add_argument("--reorder", action="store_true",
                    help="spectrally reorder columns so each 3-feature token is a KG-coherent "
                         "triple (essential for family='factor')")
@@ -723,6 +747,7 @@ def main() -> None:
     common = dict(
         mode=args.mode, family=args.family, rank=args.rank, reorder=args.reorder,
         n_edges=args.n_edges, knn=args.knn,
+        label_combiner=args.label_combiner, mlp_hidden=args.mlp_hidden,
         n_test=args.n_test, n_features=args.n_features, n_groups=args.n_groups,
         feature_noise=args.feature_noise, label_noise=args.label_noise,
         scan_alphas=args.scan_alphas, epochs=args.epochs, lr=args.lr,
