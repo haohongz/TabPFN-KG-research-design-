@@ -13,7 +13,9 @@ Faithful implementation of the method in wileyNJD-Doc.tex:
     order columns community-contiguously; pool d×d / d priors to token resolution by a
     MASKED MEAN over covered pairs; per-token coverage c_a and per-relation support s_a;
     masked row-softmax with a LEARNABLE temperature tau_r; per-block gates lambda^(l)_r,
-    lambda^(l)_{y,r} (zero-init, projected onto {λ>=0, Σ_r λ_r <= 1} after each step);
+    lambda^(l)_{y,r} (zero-init, projected onto {λ>=0, Σ_r λ_r <= 1} after each step;
+    --gate-mode one TIES lam_y = lam into a single shared gate set — routing asymmetry
+    kept, strengths shared);
     in-context NLL through the frozen forward with a FRESH context/query split AND a
     FRESH community-preserving permutation each episode; + L1 (+ optional TV) penalty.
   * Inference: E ensemble members, each under its own community-preserving permutation
@@ -537,8 +539,15 @@ def _project_gates(lam: torch.Tensor) -> None:
 
 def train_gates(Xtr, ytr, kg, blocks, *, model_path, device, seed, epochs, lr,
                 query_frac, l1, tv, C, pool_ff="max", patience=15, min_delta=2e-3,
-                smooth_win=10):
+                smooth_win=10, gate_mode="two"):
     """Returns (lam (L,R), lam_y (L,R), tau (R,), tau_y (R,), loss history, traj).
+
+    gate_mode='two' (default): separate feature-row gates λ and target-readout gates
+    λ_y per (block, relation). gate_mode='one': a SINGLE shared gate set — lam_y IS
+    lam (same Parameter), so one λ^(l)_r drives both routes; the routing asymmetry
+    itself (feature rows mix A^(r), readout row mixes b^(r), target column untouched)
+    lives in the prior structure and is unchanged. 共享一组λ：两条路由强度绑定，
+    但注入路径的不对称性保留在先验结构里。
     traj = {"lam": (E,R), "lam_y": (E,R)}: per-episode Σ_l λ^(l)_r trajectories — the
     DIRECT convergence readout (the per-episode loss is a high-variance estimate and
     oscillates even at fixed gates; a plateaued gate trajectory = converged).
@@ -554,6 +563,7 @@ def train_gates(Xtr, ytr, kg, blocks, *, model_path, device, seed, epochs, lr,
     stays the hard ceiling). Earliest possible stop = smooth_win + patience episodes,
     which also gives the zero-init gates time to travel into the helpful region."""
     R = len(kg["A_list"])
+    tied = gate_mode == "one"
     clf = _batched_clf(model_path, device, seed)
 
     lam = lam_y = opt = None
@@ -577,8 +587,10 @@ def train_gates(Xtr, ytr, kg, blocks, *, model_path, device, seed, epochs, lr,
                 prm.requires_grad_(False)
             n_layers = tag_block_layers(clf)
             lam = torch.nn.Parameter(torch.zeros(n_layers, R, device=device))
-            lam_y = torch.nn.Parameter(torch.zeros(n_layers, R, device=device))
-            opt = torch.optim.Adam([lam, lam_y, rho, rho_y], lr=lr)
+            lam_y = (lam if tied
+                     else torch.nn.Parameter(torch.zeros(n_layers, R, device=device)))
+            gate_params = [lam] if tied else [lam, lam_y]
+            opt = torch.optim.Adam(gate_params + [rho, rho_y], lr=lr)
 
         # Per-episode prior under THIS permutation, differentiable w.r.t. temperatures.
         tau = F.softplus(rho) + 1e-3
@@ -591,17 +603,21 @@ def train_gates(Xtr, ytr, kg, blocks, *, model_path, device, seed, epochs, lr,
             logits = logits_QBEL.permute(1, 2, 3, 0).reshape(Bn * E, L, Q)
             targets = batch.y_query.repeat(Bn * E, 1).to(device)
             loss = F.cross_entropy(logits, targets)
-            if l1 > 0:
-                loss = loss + l1 * (lam.sum() + lam_y.sum())   # λ >= 0 after projection
+            if l1 > 0:  # penalize each DISTINCT parameter once (tied: lam_y is lam)
+                pen = lam.sum() if tied else lam.sum() + lam_y.sum()
+                loss = loss + l1 * pen                         # λ >= 0 after projection
             if tv > 0:
-                loss = loss + tv * ((lam[1:] - lam[:-1]).abs().sum()
-                                    + (lam_y[1:] - lam_y[:-1]).abs().sum())
+                pen = (lam[1:] - lam[:-1]).abs().sum()
+                if not tied:
+                    pen = pen + (lam_y[1:] - lam_y[:-1]).abs().sum()
+                loss = loss + tv * pen
 
         opt.zero_grad()
         loss.backward()
         opt.step()
         _project_gates(lam)
-        _project_gates(lam_y)
+        if not tied:
+            _project_gates(lam_y)
         history.append(float(loss.detach()))
         traj_lam.append(lam.detach().sum(0).cpu().numpy())
         traj_lam_y.append(lam_y.detach().sum(0).cpu().numpy())
@@ -701,13 +717,15 @@ def run_condition(*, seed, n_train, args) -> dict:
         epochs=args.epochs, lr=args.lr, query_frac=args.query_frac,
         l1=args.l1, tv=args.tv, C=C, pool_ff=args.pool_ff,
         patience=args.patience, min_delta=args.min_delta,
+        gate_mode=args.gate_mode,
     )
     time_train = time.time() - t0
 
     common = dict(members=args.members, model_path=args.model_path,
                   device=args.device, seed=seed)
     rec = dict(seed=seed, n_train=n_train, dgp=args.dgp,
-               n_known=args.n_known, kg_frac=args.kg_frac)
+               n_known=args.n_known, kg_frac=args.kg_frac,
+               gate_mode=args.gate_mode)
     rec["time_train"] = time_train
 
     t0 = time.time()
@@ -729,21 +747,26 @@ def run_condition(*, seed, n_train, args) -> dict:
                             gates_on=True, pool_ff=args.pool_ff, **common)
     rec["time_ours"] = time.time() - t0
 
+    t0 = time.time()
+    rec["oracle"] = eval_vanilla(prob, cols=prob["rel"], **common)
+    rec["time_oracle"] = time.time() - t0
+
     # Per-relation gate mass over blocks: every relation r has a feature-row gate
     # column lam[:, r] and a target-readout gate column lam_y[:, r] (mixed: r=0 corr,
     # r=1 int, r=2 relevance; label: r=0). Gates on an empty channel stay ~0 (inert).
     lam_sums = np.round(lam.sum(0).cpu().numpy(), 2).tolist()
     lamy_sums = np.round(lam_y.sum(0).cpu().numpy(), 2).tolist()
-    print(f"[n={n_train} {tag} s={seed}] "
+    print(f"[n={n_train} {tag} s={seed} gates={args.gate_mode}] "
           f"base={100*rec['base']:.1f} van={100*rec['vanilla']:.1f} "
           f"ours0={100*rec['ours0']:.1f} ours={100*rec['ours']:.1f} "
+          f"oracle={100*rec['oracle']:.1f} "
           f"| loss {hist[0]:.3f}->{hist[-1]:.3f} ({len(hist)} eps) "
           f"| Σλ per rel {lam_sums} Σλ_y per rel {lamy_sums} "
           f"tau={np.round((tau).cpu().numpy(), 2).tolist()} "
           f"tau_y={np.round((tau_y).cpu().numpy(), 2).tolist()}")
     print(f"  Times (s): train={time_train:.1f}, base={rec['time_base']:.1f}, "
           f"vanilla={rec['time_vanilla']:.1f}, ours0={rec['time_ours0']:.1f}, "
-          f"ours={rec['time_ours']:.1f}")
+          f"ours={rec['time_ours']:.1f}, oracle={rec['time_oracle']:.1f}")
     rec["lam_profile"] = np.round(lam.cpu().numpy(), 3).tolist()      # (L,R) per block
     rec["lam_y_profile"] = np.round(lam_y.cpu().numpy(), 3).tolist()  # (L,R) per block
     rec["lam_sums"] = lam_sums
@@ -754,10 +777,11 @@ def run_condition(*, seed, n_train, args) -> dict:
     return rec
 
 
-METHODS = ["base", "vanilla", "ours0", "ours"]
+METHODS = ["base", "vanilla", "ours0", "ours", "oracle"]
 STYLE = {"base": ("black", "--"), "vanilla": ("tab:brown", "--"),
          "ours0": ("tab:gray", ":"),
-         "ours": ("tab:red", "-")}
+         "ours": ("tab:red", "-"),
+         "oracle": ("tab:green", "-.")}
 
 
 def plot_results(df, save_path):
@@ -776,11 +800,13 @@ def plot_results(df, save_path):
     ax.set_ylabel("test acc (%)")
     ax.grid(True, alpha=0.3)
     ax.legend()
+    gm = df.gate_mode.iloc[0] if "gate_mode" in df.columns else "two"
     if df.dgp.iloc[0] == "mixed":
-        ax.set_title(f"KGAM mixed DGP (corr+int+label KG, kg_frac={df.kg_frac.iloc[0]})")
+        ax.set_title(f"KGAM mixed DGP (corr+int+label KG, kg_frac={df.kg_frac.iloc[0]})"
+                     f" | λ-sets: {gm}")
     else:
-        ax.set_title(f"KGAM extreme case: label-channel KG knows "
-                     f"{df.n_known.iloc[0]} relevant cols")
+        ax.set_title(f"KGAM label DGP: KG knows {df.n_known.iloc[0]} relevant cols"
+                     f" | λ-sets: {gm}")
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
@@ -838,9 +864,10 @@ def plot_times(df, save_path):
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(6.5, 4.6))
     
-    time_cols = ["time_train", "time_base", "time_vanilla", "time_ours0", "time_ours"]
-    labels = ["Train (Gates)", "Base", "Vanilla", "Ours0", "Ours"]
-    colors = ["tab:purple", "black", "tab:brown", "tab:gray", "tab:red"]
+    time_cols = ["time_train", "time_base", "time_vanilla", "time_ours0", "time_ours",
+                 "time_oracle"]
+    labels = ["Train (Gates)", "Base", "Vanilla", "Ours0", "Ours", "Oracle"]
+    colors = ["tab:purple", "black", "tab:brown", "tab:gray", "tab:red", "tab:green"]
     
     for col, label, color in zip(time_cols, labels, colors):
         if col in df.columns:
@@ -950,15 +977,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seeds", type=int, nargs="+", default=list(range(20)))
     p.add_argument("--n-train", type=int, nargs="+", default=[30, 60, 120])
     p.add_argument("--n-test", type=int, default=300)
-    p.add_argument("--dgp", choices=["label", "mixed"], default="label",
+    p.add_argument("--dgp", choices=["label", "mixed"], default="mixed",
                    help="'label' = extreme label-channel-only case; 'mixed' = "
                         "correlation + interaction + label KG (3 relations)")
     # shared DGP knobs
-    p.add_argument("--n-features", type=int, default=200)
-    p.add_argument("--label-noise", type=float, default=0.5)
-    # --dgp label: 6 relevant i.i.d. columns at random positions, KG knows 2
-    p.add_argument("--k-rel", type=int, default=50)
-    p.add_argument("--n-known", type=int, default=40,
+    p.add_argument("--n-features", type=int, default=100)
+    p.add_argument("--label-noise", type=float, default=0.2)
+    # --dgp label: k_rel relevant i.i.d. columns at random positions, KG knows n_known.
+    # SPARSE signal by default (12/100): with the old dense setting (50/100) even the
+    # oracle on the true columns was near chance at n<=120 (headroom ~0), so no KG
+    # method could show anything. KG's value proposition is sparse signal + small n.
+    p.add_argument("--k-rel", type=int, default=12)
+    p.add_argument("--n-known", type=int, default=10,
                    help="how many of the k_rel relevant columns the KG observes (b=1)")
     p.add_argument("--n-false", type=int, default=0,
                    help="WRONG KG entries: irrelevant columns the KG claims relevant")
@@ -969,20 +999,35 @@ def parse_args() -> argparse.Namespace:
                    help="heterogeneous weight magnitudes (KG still only sees the 0/1 "
                         "edge, never the strength)")
     p.add_argument("--no-hetero-w", dest="hetero_w", action="store_false")
-    p.add_argument("--link", choices=["logit", "hard"], default="logit",
+    # default 'hard': the logit link caps Bayes acc at ~67% and crushes the
+    # oracle-base headroom to ~5pp (measured: hard link ~11pp at n=60); keep logit
+    # as a robustness arm, not the main setting.
+    p.add_argument("--link", choices=["logit", "hard"], default="hard",
                    help="'logit' = soft labels y~Bernoulli(σ(g)) (Bayes error>0); "
                         "'hard' = deterministic median threshold")
     # --dgp mixed: correlated pairs + interaction pairs + label relevance
-    p.add_argument("--n-corr", type=int, default=4,
+    # sparser + stronger than before (3+3 pairs instead of 10+10, tighter pair copies,
+    # bigger interaction weight): with the old dense setting oracle-base headroom was
+    # ~0.7pp at n=60, i.e. nothing for any KG method to win; this setting measures
+    # base~54 oracle~62 (headroom ~8pp, 4 seeds, members=2).
+    p.add_argument("--n-corr", type=int, default=3,
                    help="correlated pairs (linear signal via a shared latent)")
     p.add_argument("--n-int", type=int, default=3,
                    help="interaction pairs (label += beta_int * x_a * x_b)")
-    p.add_argument("--pair-noise", type=float, default=0.5,
-                   help="noise of the two copies around the pair latent (corr≈0.8)")
-    p.add_argument("--beta-int", type=float, default=1.5)
+    p.add_argument("--pair-noise", type=float, default=0.3,
+                   help="noise of the two copies around the pair latent")
+    p.add_argument("--beta-int", type=float, default=2.5)
     p.add_argument("--kg-frac", type=float, nargs="+", default=[1.0, 0.7],
                    help="fraction of each KG channel's entries that is observed")
-
+    # 决定lambda的数量。默认 two：one 是 two 的严格子集（label DGP 下两者数学等价，
+    # 结果逐位一致），参数量 24R vs 48R 个标量都远不到过拟合量级，two 的逐路由
+    # gate 还能分开读出（可解释性）；one 保留作消融。
+    p.add_argument("--gate-mode", choices=["two", "one"], default="two",
+                   help="'two' = separate gate sets: feature-row λ and target-readout "
+                        "λ_y per relation; 'one' = a single shared "
+                        "gate set λ drives both routes (KG nodes treated uniformly; "
+                        "the routing asymmetry — readout row mixed via b, target "
+                        "column untouched — is kept, only gate strengths are tied)")
     p.add_argument("--pool-ff", choices=["mean", "max"], default="max",
                    help="pooling for the feature-feature relations (tex: max for "
                         "edge-sparse graphs; mean dilutes single edges by up to 1/p^2)")
@@ -1014,7 +1059,11 @@ def main() -> None:
 
     recs = []
     kg_fracs = args.kg_frac if isinstance(args.kg_frac, list) else [args.kg_frac]
-    
+    if args.dgp == "label":
+        # the label DGP never reads kg_frac — one pass only (sweeping it would just
+        # repeat identical runs and emit duplicate plot sets)
+        kg_fracs = [kg_fracs[0]]
+
     for kg_f in kg_fracs:
         for n_train in args.n_train:
             for seed in args.seeds:
@@ -1025,18 +1074,35 @@ def main() -> None:
 
     print("\n=== mean test acc (%) ===")
     summary = df.groupby(["kg_frac", "n_train"])[METHODS].mean().mul(100).round(1)
+    summary["headroom"] = (summary["oracle"] - summary["base"]).round(1)
+    summary["gain"] = (summary["ours"] - summary["base"]).round(1)
+    # captured = KG 增益占 headroom 的比例；headroom 太小时该比值无意义，置 NaN
+    summary["captured%"] = np.where(
+        summary["headroom"] >= 1.0,
+        (100 * summary["gain"] / summary["headroom"]).round(0), np.nan)
     print(summary.to_string())
-    print("\n(read: ours - base = total KG gain; ours0 - base = perm-sampler share; "
-          "ours - ours0 = attention-mixture share; "
+    print("\n(read: gain = ours - base = total KG gain; "
+          "headroom = oracle - base = what a perfect KG could buy; "
+          "captured% = gain/headroom; ours0 - base = perm-sampler share; "
           "vanilla differs from base only by preprocessing, not KG)")
           
-    # Generate separate plots for each kg_frac
+    # Raw records: everything needed to replot locally without rerunning.
+    run_stem = f"{args.out}_{args.dgp}_lam{args.gate_mode}"
+    df.to_json(f"{run_stem}_records.json", orient="records")
+    print(f"Records saved -> {run_stem}_records.json")
+
+    # Filenames: <out>_<dgp>_lam<gate_mode>_<DGP-specific knob>_<plot>.png
+    #   label: the KG knob is coverage of the relevance channel -> known{n_known}of{k_rel}
+    #   mixed: the KG knob is the observed fraction per channel -> frac{kg_frac}
+    # so one/two-gate runs and the two DGPs can never overwrite each other.
     for kg_f, group_df in df.groupby("kg_frac"):
-        suffix = f"_frac{kg_f}" if len(kg_fracs) > 1 else ""
-        plot_results(group_df.copy(), f"{args.out}{suffix}_acc.png")
-        plot_lambdas(group_df.copy(), f"{args.out}{suffix}_lambdas.png")
-        plot_times(group_df.copy(), f"{args.out}{suffix}_times.png")
-        plot_loss(group_df.copy(), f"{args.out}{suffix}_loss.png")
+        knob = (f"known{args.n_known}of{args.k_rel}" if args.dgp == "label"
+                else f"frac{kg_f}")
+        stem = f"{run_stem}_{knob}"
+        plot_results(group_df.copy(), f"{stem}_acc.png")
+        plot_lambdas(group_df.copy(), f"{stem}_lambdas.png")
+        plot_times(group_df.copy(), f"{stem}_times.png")
+        plot_loss(group_df.copy(), f"{stem}_loss.png")
 
 
 if __name__ == "__main__":
